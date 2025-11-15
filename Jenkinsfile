@@ -3,135 +3,255 @@ pipeline {
     
     environment {
         DOCKER_IMAGE = "python-webapp"
-        DOCKER_TAG = "${BUILD_NUMBER}"
-        DEPLOY_SERVER = "144.24.153.184"     // deployment server IP
-        DEPLOY_USER = "virajith"             // 🔥 changed from ubuntu → your actual SSH user
-        DEPLOY_PATH = "/home/virajith/webapp" // adjust if needed
-        SSH_PORT = "4003"                    // 🔥 custom SSH port
+        DEPLOY_SERVER = "144.24.153.184"
+        DEPLOY_USER = "virajith"
+        DEPLOY_PATH = "/home/virajith/webapp"
+        SSH_PORT = "4003"
+        CONTAINER_NAME = "python-webapp-container"
     }
     
     stages {
-
         stage('Checkout') {
             steps {
-                echo '🔍 Checking out code from repository...'
+                echo '🔍 Checking out code from GitHub...'
                 checkout scm
+                sh 'ls -la'
             }
         }
-
-        stage('Build Docker Image') {
+        
+        stage('Validate Files') {
             steps {
-                echo '🏗️ Building Docker image...'
+                echo '✅ Validating project files...'
                 script {
                     sh """
-                        docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
-                        docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest
+                        echo "Checking required files..."
+                        test -f app.py && echo "✓ app.py found" || exit 1
+                        test -f requirements.txt && echo "✓ requirements.txt found" || exit 1
+                        test -f Dockerfile && echo "✓ Dockerfile found" || exit 1
+                        test -f templates/index.html && echo "✓ templates/index.html found" || exit 1
+                        echo "All required files present!"
                     """
                 }
             }
         }
-
-        stage('Test') {
+        
+        stage('Transfer Code to Server') {
             steps {
-                echo '🧪 Running tests...'
-                script {
-                    sh """
-                        docker run --rm ${DOCKER_IMAGE}:${DOCKER_TAG} python -c "
-import flask
-print('Flask imported successfully')
-print('Flask version:', flask.__version__)
-"
-                    """
-                }
-            }
-        }
-
-        stage('Save Docker Image') {
-            steps {
-                echo '💾 Saving Docker image to tar file...'
-                script {
-                    sh """
-                        docker save ${DOCKER_IMAGE}:latest -o ${DOCKER_IMAGE}.tar
-                        ls -lh ${DOCKER_IMAGE}.tar
-                    """
-                }
-            }
-        }
-
-        stage('Deploy to Server') {
-            steps {
-                echo '🚀 Deploying to production server...'
-                
-                // 🔥 IMPORTANT: must match the Jenkins SSH credential ID
+                echo '📤 Transferring code to deployment server...'
                 sshagent(['deployment-server-ssh']) {
                     script {
                         sh """
-                            echo "📦 Transferring Docker image..."
-                            scp -P ${SSH_PORT} -o StrictHostKeyChecking=no ${DOCKER_IMAGE}.tar ${DEPLOY_USER}@${DEPLOY_SERVER}:${DEPLOY_PATH}/
-
-                            echo "🔧 Deploying on remote server..."
+                            # Create directories on deployment server
+                            echo "Creating deployment directories..."
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} '
+                                mkdir -p ${DEPLOY_PATH}/templates
+                                echo "Directories created successfully"
+                            '
+                            
+                            # Transfer application files
+                            echo "Transferring files..."
+                            scp -P ${SSH_PORT} -o StrictHostKeyChecking=no \
+                                app.py requirements.txt Dockerfile \
+                                ${DEPLOY_USER}@${DEPLOY_SERVER}:${DEPLOY_PATH}/
+                            
+                            # Transfer templates directory
+                            scp -P ${SSH_PORT} -o StrictHostKeyChecking=no \
+                                templates/index.html \
+                                ${DEPLOY_USER}@${DEPLOY_SERVER}:${DEPLOY_PATH}/templates/
+                            
+                            # Verify files transferred
+                            echo "Verifying files on remote server..."
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} '
+                                cd ${DEPLOY_PATH}
+                                echo "Files in deployment directory:"
+                                ls -la
+                                echo ""
+                                echo "Files in templates directory:"
+                                ls -la templates/
+                            '
+                            
+                            echo "✅ All files transferred successfully!"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Image on Server') {
+            steps {
+                echo '🏗️ Building Docker image on ARM64 server...'
+                sshagent(['deployment-server-ssh']) {
+                    script {
+                        sh """
                             ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH'
                                 cd ${DEPLOY_PATH}
-
-                                echo "📥 Loading Docker image..."
-                                docker load -i ${DOCKER_IMAGE}.tar
-
-                                echo "🛑 Stopping old container..."
-                                docker stop python-webapp-container 2>/dev/null || true
-                                docker rm python-webapp-container 2>/dev/null || true
-
-                                echo "▶️ Starting new container..."
-                                docker run -d \\
-                                    --name python-webapp-container \\
-                                    --restart unless-stopped \\
-                                    -p 80:5000 \\
-                                    ${DOCKER_IMAGE}:latest
-
-                                echo "🧹 Cleaning up..."
-                                rm -f ${DOCKER_IMAGE}.tar
-                                docker image prune -f
-
-                                echo "✅ Deployment complete!"
+                                
+                                echo "Building Docker image with ARM64 platform..."
+                                docker build --platform linux/arm64 -t ${DOCKER_IMAGE}:${BUILD_NUMBER} .
+                                docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER} ${DOCKER_IMAGE}:latest
+                                
+                                echo "✅ Docker image built successfully!"
+                                docker images | grep ${DOCKER_IMAGE}
 ENDSSH
                         """
                     }
                 }
             }
         }
-
+        
+        stage('Stop Old Container') {
+            steps {
+                echo '🛑 Stopping old container if exists...'
+                sshagent(['deployment-server-ssh']) {
+                    script {
+                        sh """
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH'
+                                # Stop and remove old container (ignore errors if it doesn't exist)
+                                docker stop ${CONTAINER_NAME} 2>/dev/null || echo "No container to stop"
+                                docker rm ${CONTAINER_NAME} 2>/dev/null || echo "No container to remove"
+                                echo "✅ Old container cleaned up"
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy New Container') {
+            steps {
+                echo '🚀 Starting new container...'
+                sshagent(['deployment-server-ssh']) {
+                    script {
+                        sh """
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH'
+                                cd ${DEPLOY_PATH}
+                                
+                                echo "Starting container with volume bind..."
+                                docker run -d \\
+                                    --name ${CONTAINER_NAME} \\
+                                    --restart unless-stopped \\
+                                    --platform linux/arm64 \\
+                                    -p 80:5000 \\
+                                    -v ${DEPLOY_PATH}:/app:ro \\
+                                    ${DOCKER_IMAGE}:latest
+                                
+                                echo "✅ Container started!"
+                                echo "Waiting 5 seconds for container to initialize..."
+                                sleep 5
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                echo '🔍 Verifying deployment...'
+                sshagent(['deployment-server-ssh']) {
+                    script {
+                        sh """
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH'
+                                echo "============================================"
+                                echo "Container Status:"
+                                docker ps --filter name=${CONTAINER_NAME} --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+                                
+                                echo ""
+                                echo "Container is running:" 
+                                docker ps | grep ${CONTAINER_NAME} || exit 1
+                                
+                                echo ""
+                                echo "Recent Logs:"
+                                docker logs --tail 20 ${CONTAINER_NAME}
+                                echo "============================================"
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
+        
         stage('Health Check') {
             steps {
-                echo '🏥 Performing health check...'
+                echo '🏥 Running health checks...'
                 script {
                     sh """
-                        echo "Waiting 10 seconds for application to start..."
+                        echo "Waiting 10 seconds for application to be ready..."
                         sleep 10
-
-                        curl -f http://${DEPLOY_SERVER}/health || exit 1
-                        curl -f http://${DEPLOY_SERVER}/ || exit 1
-
+                        
+                        echo "Testing health endpoint..."
+                        curl -f -m 10 http://${DEPLOY_SERVER}/health || {
+                            echo "❌ Health check failed!"
+                            exit 1
+                        }
+                        
+                        echo "Testing home page..."
+                        curl -f -m 10 http://${DEPLOY_SERVER}/ || {
+                            echo "❌ Home page check failed!"
+                            exit 1
+                        }
+                        
                         echo "✅ All health checks passed!"
                     """
                 }
             }
         }
+        
+        stage('Cleanup Old Images') {
+            steps {
+                echo '🧹 Cleaning up old Docker images...'
+                sshagent(['deployment-server-ssh']) {
+                    script {
+                        sh """
+                            ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH'
+                                echo "Removing unused Docker images..."
+                                docker image prune -f
+                                echo "✅ Cleanup complete!"
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
     }
-
+    
     post {
         success {
-            echo '✅ Pipeline completed successfully!'
-            echo "🌐 URL: http://${DEPLOY_SERVER}"
-            echo "🏥 Health: http://${DEPLOY_SERVER}/health"
+            echo '✅✅✅ DEPLOYMENT SUCCESSFUL! ✅✅✅'
+            echo '============================================'
+            echo "🌐 Application URL: http://${DEPLOY_SERVER}"
+            echo "🏥 Health Check: http://${DEPLOY_SERVER}/health"
+            echo "📦 Build Number: ${BUILD_NUMBER}"
+            echo '============================================'
         }
+        
         failure {
-            echo '❌ Pipeline failed!'
+            echo '❌❌❌ DEPLOYMENT FAILED! ❌❌❌'
+            echo 'Collecting debug information...'
+            sshagent(['deployment-server-ssh']) {
+                script {
+                    sh """
+                        ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'ENDSSH' || true
+                            echo "============================================"
+                            echo "Container Status:"
+                            docker ps -a | grep ${CONTAINER_NAME} || echo "Container not found"
+                            
+                            echo ""
+                            echo "Last 50 lines of container logs:"
+                            docker logs --tail 50 ${CONTAINER_NAME} 2>&1 || echo "No logs available"
+                            
+                            echo ""
+                            echo "Docker Images:"
+                            docker images | grep ${DOCKER_IMAGE} || echo "No images found"
+                            echo "============================================"
+ENDSSH
+                    """ || true
+                }
+            }
         }
+        
         always {
-            echo '🧹 Cleaning workspace...'
-            sh """
-                docker rmi ${DOCKER_IMAGE}:${DOCKER_TAG} 2>/dev/null || true
-                rm -f ${DOCKER_IMAGE}.tar
-            """
+            echo '📊 Pipeline execution completed'
         }
     }
 }
