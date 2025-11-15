@@ -132,7 +132,7 @@ ENDSSH
                                     --restart unless-stopped \\
                                     --platform linux/arm64 \\
                                     -p 80:5000 \\
-                                    -v ${DEPLOY_PATH}:/app:ro \\
+                                    -v ${DEPLOY_PATH}:/app:rw \\
                                     ${DOCKER_IMAGE}:latest
                                 
                                 echo "✅ Container started!"
